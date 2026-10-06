@@ -1,0 +1,13 @@
+{
+  "name": "tnsbtc-mail-server",
+  "version": "1.0.0",
+  "description": "TN Rare Blood Club TNSBTC mail server",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^5.1.0",
+    "nodemailer": "^7.0.6"
+  }
+}
