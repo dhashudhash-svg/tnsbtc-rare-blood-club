@@ -981,6 +981,7 @@ function dnEmailCard(x,r,total){
   '</div>';
 }
 }
+withMail.forEach(x=>loadDonorResponse(x));
 function dnPreview(r){
   if(!r||!r.dn) return '';
   const recs=DONOR_EMAILS.filter(x=>x.reqId===r.id), withMail=recs.filter(x=>x.email), noMail=recs.filter(x=>!x.email), mk=dnMasked();
