@@ -97,7 +97,35 @@ app.post("/api/notifications/donor-email", async (req, res) => {
                         email: replyTo
                     },
                     subject: String(subject),
-                    textContent: String(body)
+                    htmlContent: `
+    <div style="font-family:Arial,sans-serif;line-height:1.6;color:#222;">
+        <div style="white-space:pre-line;">
+            ${String(body)
+                .replace(/&/g, "&amp;")
+                .replace(/</g, "&lt;")
+                .replace(/>/g, "&gt;")
+                .replace(/"/g, "&quot;")
+                .replace(/'/g, "&#039;")}
+        </div>
+
+        <div style="margin-top:25px;">
+            <a href="${process.env.PUBLIC_BASE_URL}/api/donor-response?requestId=${encodeURIComponent(requestId)}&donorId=${encodeURIComponent(donorId)}&response=available"
+               style="display:inline-block;padding:12px 22px;background:#16803c;color:white;text-decoration:none;border-radius:6px;font-weight:bold;margin-right:10px;">
+               I AM AVAILABLE
+            </a>
+
+            <a href="${process.env.PUBLIC_BASE_URL}/api/donor-response?requestId=${encodeURIComponent(requestId)}&donorId=${encodeURIComponent(donorId)}&response=not_available"
+               style="display:inline-block;padding:12px 22px;background:#c62828;color:white;text-decoration:none;border-radius:6px;font-weight:bold;">
+               I AM NOT AVAILABLE
+            </a>
+        </div>
+
+        <p style="margin-top:25px;color:#666;font-size:13px;">
+            TN Rare Blood Club<br>
+            Tamil Nadu State Blood Transfusion Council
+        </p>
+    </div>
+`
                 })
             }
         );
