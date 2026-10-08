@@ -675,7 +675,7 @@ function reqById(id){ return REQUESTS.find(x=>x.id===id); }
      Blood Centre -> Blood Request -> Group Matching -> Donor Registry
        -> Matching Donors -> Backend (this endpoint) -> Email Provider -> Donor
    ================================================================ */
-const EMAIL_BACKEND = { enabled:true, endpoint:'/api/notifications/donor-email' };
+const EMAIL_BACKEND = { enabled:true, endpoint: 'https://tnsbtc-rare-blood-club-production-ed77.up.railway.app/api/notifications/donor-email' };
 const EMAIL_RE = /^[^@\s]+@[^@\s]+\.[^@\s]+$/;
 
 function nowStamp(){
