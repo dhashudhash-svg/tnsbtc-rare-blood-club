@@ -675,7 +675,11 @@ function reqById(id){ return REQUESTS.find(x=>x.id===id); }
      Blood Centre -> Blood Request -> Group Matching -> Donor Registry
        -> Matching Donors -> Backend (this endpoint) -> Email Provider -> Donor
    ================================================================ */
-const EMAIL_BACKEND = { enabled:true, endpoint: 'https://tnsbtc-rare-blood-club-production-ed77.up.railway.app/api/notifications/donor-email' };
+const EMAIL_BACKEND = { enabled:true, endpoint:'/api/notifications/donor-email' };
+const RESPONSE_BACKEND_BASE='https://tnsbtc-rare-blood-club.onrender.com';
+const EMAIL_MODE_KEY='tnsbtc_email_mode';
+function getEmailMode(){ return localStorage.getItem(EMAIL_MODE_KEY)==='real' ? 'real' : 'demo'; }
+function setEmailMode(mode){ localStorage.setItem(EMAIL_MODE_KEY, mode==='real'?'real':'demo'); render(); toast(mode==='real'?'Real Email Mode selected — Brevo will send to the Excel email addresses.':'Demo Email Mode selected — no real email will be sent.'); }
 const EMAIL_RE = /^[^@\s]+@[^@\s]+\.[^@\s]+$/;
 
 function nowStamp(){
@@ -715,6 +719,14 @@ function findMatchingDonors(bloodGroup){
   const k=bgKey(bloodGroup); if(!k) return [];
   return DONORS.filter(d=>bgKey(d.group)===k);
 }
+function donorEligibleForNotification(d){ return String(d.status||'').toLowerCase()==='active' && String(d.eligible||'').toLowerCase()==='yes' && String(d.consent||'').toLowerCase()==='yes' && !!donorEmail(d); }
+function donorExclusionReason(d){
+  if(!donorEmail(d)) return 'Email Address Not Available';
+  if(String(d.status||'').toLowerCase()!=='active') return 'Excluded - '+(d.status||'Inactive');
+  if(String(d.eligible||'').toLowerCase()!=='yes') return 'Excluded - Not Eligible';
+  if(String(d.consent||'').toLowerCase()!=='yes') return 'Excluded - No Consent';
+  return '';
+}
 function donorEmail(d){
   const e=String(d.email||'').trim(); if(EMAIL_RE.test(e)) return e;
   if(d.xdata){   // fall back to any e-mail-like column kept from the Excel row
@@ -732,6 +744,7 @@ function composeDonorEmail(req, donor){
   const urgent = req.type==='Emergency';
   const subject = (urgent?'Urgent Blood Requirement – ':'Blood Requirement – ')+req.group;
   const L=[];
+  const responseBase=RESPONSE_BACKEND_BASE+'/api/donor-response?requestId='+encodeURIComponent(req.id)+'&donorId='+encodeURIComponent(donor.id);
   L.push('Dear '+(donor.name||'Donor')+',','');
   L.push('A blood requirement has been raised through the TN Rare Blood Club platform.','');
   L.push('Blood Group: '+req.group);
@@ -743,8 +756,10 @@ function composeDonorEmail(req, donor){
   if(req.ward && req.ward!=='—') L.push('Ward: '+req.ward);
   if(req.ip && req.ip!=='—' && !req.ipGenerated) L.push('IP Number: '+req.ip);
   if(req.surgery) L.push('Planned Surgery Date: '+req.surgery);
-  L.push('','If you are available and eligible to donate, please respond through the TN Rare Blood Club platform.','');
-  L.push('Thank you for helping save a life.','','TN Rare Blood Club','Tamil Nadu State Blood Transfusion Council');
+  L.push('','If you are available to donate, please respond using one of these links:','');
+  L.push('I AM AVAILABLE: '+responseBase+'&response=available');
+  L.push('I AM NOT AVAILABLE: '+responseBase+'&response=not_available');
+  L.push('','If you do not respond, your status remains No Response.','','Thank you for helping save a life.','','TN Rare Blood Club','Tamil Nadu State Blood Transfusion Council');
   return {subject:subject, body:L.join('\n')};
 }
 
@@ -752,32 +767,30 @@ function composeDonorEmail(req, donor){
 function prepareDonorNotifications(request, matchingDonors){
   const stamp=nowStamp(), records=[];
   matchingDonors.forEach(d=>{
-    const to=donorEmail(d), id='EM-'+request.id+'-'+d.id;
-    const rec={id:id, reqId:request.id, donorId:d.id, donor:d.name, email:to, group:request.group,
-      component:request.component, units:request.units, channel:'Email', preparedAt:stamp, sentAt:'',
-      subject:'', body:'', status:'Email Address Not Available', note:'Email address not available'};
-    if(to){ const m=composeDonorEmail(request,d); rec.subject=m.subject; rec.body=m.body; rec.status='Ready to Send'; rec.note='Notification prepared'; }
-    const ix=DONOR_EMAILS.findIndex(x=>x.id===id); if(ix>-1) DONOR_EMAILS.splice(ix,1);
-    records.push(rec);
+    const to=donorEmail(d), id='EM-'+request.id+'-'+d.id, reason=donorExclusionReason(d);
+    const rec={id:id,reqId:request.id,donorId:d.id,donor:d.name,email:to,group:request.group,component:request.component,units:request.units,channel:'Email',preparedAt:stamp,sentAt:'',subject:'',body:'',status:reason||'Ready to Send',note:reason||'Notification prepared',donorResponse:'No Response',responseAt:''};
+    if(to){ const m=composeDonorEmail(request,d); rec.subject=m.subject; rec.body=m.body; }
+    const ix=DONOR_EMAILS.findIndex(x=>x.id===id); if(ix>-1) DONOR_EMAILS.splice(ix,1); records.push(rec);
   });
   records.slice().reverse().forEach(r=>DONOR_EMAILS.unshift(r));
-  return {records:records, withEmail:records.filter(r=>r.email).length, unavailable:records.filter(r=>!r.email).length};
+  return {records:records,withEmail:records.filter(r=>r.status==='Ready to Send'||r.status==='Sent').length,unavailable:records.filter(r=>r.status==='Email Address Not Available').length,eligible:records.filter(r=>r.status==='Ready to Send').length,excluded:records.filter(r=>String(r.status).indexOf('Excluded -')===0).length};
 }
 
 /* ---- Backend hook. Until a mail server is connected, nothing is marked Sent or Delivered. ---- */
-async function sendDonorNotificationEmail(rec){
+async function sendDonorNotificationEmail(rec, modeOverride){
+  const mode=modeOverride||getEmailMode();
   if(!EMAIL_BACKEND.enabled){ rec.status='Ready to Send'; rec.note='Notification prepared'; return rec; }
   try{
     const res=await fetch(EMAIL_BACKEND.endpoint,{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({requestId:rec.reqId,donorId:rec.donorId,to:rec.email,donorName:rec.donor,subject:rec.subject,body:rec.body})});
+      body:JSON.stringify({requestId:rec.reqId,donorId:rec.donorId,to:rec.email,donorName:rec.donor,subject:rec.subject,body:rec.body,mode:mode})});
     if(!res.ok) throw new Error('HTTP '+res.status);
-    rec.status='Sent'; rec.sentAt=nowStamp(); rec.note='Accepted by email backend';
+    rec.status='Sent'; rec.sentAt=nowStamp(); rec.note=(mode==='real'?'Accepted by Brevo':'Demo email recorded — no real email sent');
   }catch(err){ rec.status='Failed'; rec.note=String((err&&err.message)||err); }
   return rec;
 }
 async function dispatchDonorNotifications(req, records){
   if(!EMAIL_BACKEND.enabled) return;
-  const todo=records.filter(r=>r.email);
+  const todo=records.filter(r=>r.status==='Ready to Send' && r.email);
   for(let i=0;i<todo.length;i++) await sendDonorNotificationEmail(todo[i]);
   const sent=todo.filter(r=>r.status==='Sent').length, failed=todo.filter(r=>r.status==='Failed').length;
   req.dn.sent=sent; req.dn.failed=failed; req.dn.status=failed?(sent?'Partially Sent':'Failed'):'Sent';
@@ -790,26 +803,66 @@ function dnAuditDetail(req, extra){
   return 'Request '+req.id+' · Blood group '+req.group+' · Matching donors '+(d.matched||0)+' · Email recipients '+(d.withEmail||0)+(extra?' · '+extra:'');
 }
 
+
+/* ---- e-RaktKosh donor notification: use ONLY donors imported from the uploaded Excel ---- */
+function eraktKoshExcelDonorsForGroup(group){
+  const k=bgKey(group);
+  return DONORS.filter(d=>d.xl===1 && bgKey(d.group)===k);
+}
+function eraktKoshNotificationSummary(req){
+  const matches=eraktKoshExcelDonorsForGroup(req.group);
+  const eligible=matches.filter(d=>donorEligibleForNotification(d));
+  const noEmail=matches.filter(d=>!donorEmail(d));
+  const excluded=matches.filter(d=>donorEmail(d)&&!donorEligibleForNotification(d));
+  return {matches,eligible,noEmail,excluded};
+}
+async function sendEligibleExcelDonorEmails(requestId){
+  const req=reqById(requestId);
+  if(!req){ toast('Blood request not found'); return; }
+  if(S.dnSending&&S.dnSending[requestId]) return;
+  const mode='real';
+  const q=eraktKoshNotificationSummary(req);
+  if(!q.matches.length){ toast('No imported e-RaktKosh donor matches '+req.group); return; }
+  const prep=prepareDonorNotifications(req,q.matches);
+  req.dn=req.dn||{at:nowStamp(),matched:q.matches.length,eligible:prep.eligible,withEmail:prep.withEmail,unavailable:prep.unavailable,excluded:prep.excluded,status:'Ready to Send',sent:0,failed:0};
+  req.dn.matched=q.matches.length; req.dn.eligible=prep.eligible; req.dn.withEmail=prep.withEmail; req.dn.unavailable=prep.unavailable; req.dn.excluded=prep.excluded;
+  const todo=prep.records.filter(r=>r.status==='Ready to Send'&&r.email);
+  if(!todo.length){ toast('No eligible e-RaktKosh donor has a valid email address'); render(); return; }
+  toast('Sending '+todo.length+' email(s) to imported e-RaktKosh donors...');
+  S.dnSending=S.dnSending||{}; S.dnSending[req.id]=true; render();
+  for(let i=0;i<todo.length;i++) await sendDonorNotificationEmail(todo[i],mode);
+  S.dnSending[req.id]=false; S.dnDone=S.dnDone||{}; S.dnDone[req.id]=true;
+  req.dn.sent=todo.filter(r=>r.status==='Sent').length;
+  req.dn.failed=todo.filter(r=>r.status==='Failed').length;
+  req.dn.status=req.dn.failed?(req.dn.sent?'Partially Sent':'Failed'):'Sent';
+  persistData();
+  logActivity('e-RaktKosh donor emails processed','Donor Notification',
+    'Request '+req.id+' · '+req.group+' · Mode '+mode+' · Sent '+req.dn.sent+' · Failed '+req.dn.failed,'Success');
+  render();
+  toast('Brevo email processing completed: '+req.dn.sent+' sent, '+req.dn.failed+' failed');
+}
+
 /* ---- Orchestrator, called after OTP verification creates the request ---- */
 function runDonorNotificationWorkflow(req){
   const stamp=nowStamp();
   const matches=findMatchingDonors(req.group);
   const prep=prepareDonorNotifications(req,matches);
-  const status = !matches.length ? 'No Match' : (prep.withEmail ? 'Ready to Send' : 'Email Address Not Available');
-  req.dn={at:stamp, matched:matches.length, withEmail:prep.withEmail, unavailable:prep.unavailable, status:status, sent:0, failed:0};
+  const status = !matches.length ? 'No Match' : (prep.eligible ? 'Ready to Send' : 'No Eligible Donor');
+  req.dn={at:stamp,matched:matches.length,eligible:prep.eligible,withEmail:prep.withEmail,unavailable:prep.unavailable,excluded:prep.excluded,status:status,sent:0,failed:0};
   // seed the existing donor-matching state so the request drawer lists the same donors
-  const st={}; matches.forEach(d=>{ st[d.id]={match:'Matched',notify:'Not sent',response:'—'}; }); REQ_MATCH_STATE[req.id]=st;
+  const st={}; matches.forEach(d=>{ const rec=DONOR_EMAILS.find(x=>x.reqId===req.id&&x.donorId===d.id); st[d.id]={match:donorEligibleForNotification(d)?'Eligible':'Excluded',notify:rec&&rec.status==='Ready to Send'?'Ready to Send':(rec?rec.status:'Not sent'),response:rec?rec.donorResponse:'No Response'}; }); REQ_MATCH_STATE[req.id]=st;
 
   logActivity('Blood request created','Donor Notification','Request '+req.id+' · Blood group '+req.group+' · '+req.component+' × '+req.units+' · '+req.hospital,'Success');
   logActivity('Blood group selected','Donor Notification','Request '+req.id+' · Blood group '+req.group,'Success');
   logActivity('Matching donors identified','Donor Notification',dnAuditDetail(req),matches.length?'Success':'Warning');
-  if(prep.withEmail) logActivity('Email notification prepared','Donor Notification',dnAuditDetail(req,'Status: Ready to Send'),'Success');
+  if(prep.eligible) logActivity('Email notification prepared','Donor Notification',dnAuditDetail(req,'Eligible email recipients: '+prep.eligible),'Success');
   if(prep.unavailable) logActivity('Email address not available','Donor Notification',dnAuditDetail(req,prep.unavailable+' matching donor(s) have no email address'),'Warning');
+  if(prep.excluded) logActivity('Donors excluded from notification','Donor Notification',dnAuditDetail(req,prep.excluded+' donor(s) failed status, eligibility or consent checks'),'Warning');
 
   NOTIF_STORE.unshift({id:'N-'+Date.now(),icon:'mail',tone:req.type==='Emergency'?'critical':'info',category:'Live Requests',dn:1,
     title:'Blood Requirement Notification — '+req.group+' · '+req.id,
     detail:'Blood Group: '+req.group+' · Component: '+req.component+' · Units Required: '+req.units+' · Recipients: '+matches.length+' donor'+(matches.length===1?'':'s')+
-      ' · Notifications Prepared: '+prep.withEmail+(prep.unavailable?' · Email Address Not Available: '+prep.unavailable:'')+' · Status: '+dnLabel(status),
+      ' · Eligible Email Recipients: '+prep.eligible+(prep.unavailable?' · Email Address Not Available: '+prep.unavailable:'')+(prep.excluded?' · Excluded: '+prep.excluded:'')+' · Status: '+dnLabel(status),
     time:stamp,read:false,link:{kind:'request',id:req.id}});
   CENTRE_NOTIFICATIONS.unshift({icon:'mail',tone:'info',dn:1,
     title:'Request '+req.id+': '+matches.length+' matching donor(s) found, '+prep.withEmail+' notification(s) prepared',time:stamp});
@@ -832,9 +885,8 @@ function dnStat(l,v){
 }
 function dnStats(r){
   const d=r.dn;
-  return '<div class="grid" style="grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:14px">'+
-    dnStat('Matching Donors',d.matched)+dnStat('Donors with Email',d.withEmail)+
-    dnStat('Notifications Prepared',d.withEmail)+dnStat('Email Address Not Available',d.unavailable)+'</div>';
+  return '<div class="grid" style="grid-template-columns:repeat(6,1fr);gap:10px;margin-bottom:14px">'+
+    dnStat('Matching Donors',d.matched)+dnStat('Eligible',d.eligible||0)+dnStat('Email Ready',d.withEmail||0)+dnStat('Sent',d.sent||0)+dnStat('Failed',d.failed||0)+dnStat('Excluded / No Email',(d.excluded||0)+(d.unavailable||0))+'</div>';
 }
 function dnSummary(r){
   return '<dl class="kv" style="margin:0 0 14px"><dt>Request ID</dt><dd>'+esc(r.id)+'</dd>'+
@@ -891,13 +943,33 @@ function dnPreview(r){
   }
   return h;
 }
+function dnNotifySummary(r){
+  const busy=!!(S.dnSending&&S.dnSending[r.id]), done=!!(S.dnDone&&S.dnDone[r.id]), d=r.dn;
+  const q=eraktKoshNotificationSummary(r), live=busy||done;
+  const matched=live?(d.matched||0):q.matches.length;
+  const excl=live?((d.excluded||0)+(d.unavailable||0)):(q.noEmail.length+q.excluded.length);
+  const sent=busy?'Processing…':(done?(d.sent||0):'—'), failed=busy?'Processing…':(done?(d.failed||0):'—');
+  const status=busy?'Sending emails… please wait':(done?'Completed':'Not sent yet');
+  return '<div style="margin-top:12px"><div class="bold" style="margin-bottom:8px">Email Notification Summary</div>'+
+    '<dl class="kv" style="margin:0"><dt>Blood Group</dt><dd>'+esc(r.group)+'</dd>'+
+    '<dt>Total Matching Donors</dt><dd>'+matched+'</dd>'+
+    '<dt>Total Emails Sent Successfully</dt><dd>'+sent+'</dd>'+
+    '<dt>Failed Emails</dt><dd>'+failed+'</dd>'+
+    '<dt>Excluded / No Email</dt><dd>'+excl+'</dd>'+
+    '<dt>Status</dt><dd>'+status+'</dd></dl></div>';
+}
 function dnResultCard(r){
   if(!r||!r.dn) return '';
   return '<div class="card card-pad" style="margin-bottom:16px;border-color:var(--teal-100)">'+
     '<div class="row-between" style="margin-bottom:12px"><div class="row" style="gap:8px">'+icon('check','ico-sm')+
       '<b style="font-size:15px">Blood Request Created Successfully</b></div>'+
       '<button class="btn btn-sm" onclick="S.reqResult=null;render()">Dismiss</button></div>'+
-    dnSummary(r)+dnStats(r)+dnPreview(r)+'</div>';
+    dnSummary(r)+dnStats(r)+
+    '<div class="card card-pad" style="margin:12px 0;border-color:var(--teal-100)">'+
+      '<div class="row-between" style="gap:12px;align-items:flex-start"><div><b>e-RaktKosh Email Notification</b><div class="tiny muted">Only donors imported from the uploaded e-RaktKosh Excel are used.</div>'+
+      '</div>'+
+      '<button class="btn btn-primary btn-sm"'+((S.dnSending&&S.dnSending[r.id])?' disabled':'')+' onclick="sendEligibleExcelDonorEmails(\''+r.id+'\')">Send Real Emails via Brevo</button></div>'+
+    dnNotifySummary(r)+'</div>'+'</div>';
 }
 function dnDrawerSection(r){
   if(!r||!r.dn) return '';
@@ -1880,7 +1952,7 @@ function registryFilters(groups){
         Array.from(new Set(groups.concat(DONORS.map(x=>x.group),CITIZENS.map(x=>x.group)).filter(Boolean))).map(g=>'<option '+(S.filters.g===g?'selected':'')+'>'+esc(g)+'</option>').join('')+
       '</select></div>'+
       '<div class="field"><label>Status</label><select onchange="S.filters.s=this.value;render()">'+
-        '<option value="">Any status</option><option>Active</option><option>Deferred</option><option>Unreachable</option>'+
+        '<option value="">Any status</option><option>Active</option><option>Deferred</option><option>Inactive</option><option>Unreachable</option>'+
       '</select></div>'+
       '<button class="btn" onclick="S.filters={d:\'\',g:\'\',s:\'\'};render()">Clear filters</button>'+
       '<div style="flex:1"></div>'+
@@ -1897,14 +1969,15 @@ function pageDonors(){
     (!S.filters.s||d.status===S.filters.s));
   return '<div class="content">'+
     '<div class="page-head"><div class="crumb">Module 2</div><h2>Rare Blood Donor Registry</h2>'+
-    '<p>Citizens with a rare blood group who have consented and registered as donors. Select a row for the full profile.</p></div>'+
+    '<p>Donors imported from the e-RaktKosh Excel report are shown here and become the live source for blood-group matching.</p></div>'+(DONORS.some(d=>d.xl)?'<div class="banner banner-info" style="margin-bottom:16px">'+icon('database','ico-sm')+'<div><b>e-RaktKosh data loaded.</b> Imported donor records are now available for Blood Centre requests and email matching.</div></div>':'')+
     registryFilters(RARE_GROUPS)+
+    (DONORS.some(d=>d.xl)?'<div class="banner banner-success" style="margin-bottom:12px">'+icon('check','ico-sm')+'<div><b>e-RaktKosh donor records are loaded.</b> '+DONORS.filter(d=>d.xl).length+' donor names from the uploaded Excel are now part of the live registry.</div></div>':'')+
     '<div class="card" style="overflow:hidden">'+
       '<div class="row-between" style="padding:14px 18px;border-bottom:1px solid var(--paper-line)">'+
         '<b style="font-size:13px">'+rows.length+' donors</b>'+
-        '<span class="tiny dim">Preview columns only — select a donor to view full details</span></div>'+
+        '<span class="tiny dim">'+DONORS.filter(d=>d.xl).length+' imported from e-RaktKosh Excel · select a donor to view full details</span></div>'+
       (rows.length? '<table class="tbl"><thead><tr>'+
-        '<th>Donor</th><th>Blood group</th><th>District</th><th>Last donation</th><th>Status</th><th>e-RaktKosh</th><th></th>'+
+        '<th>Donor</th><th>Blood group</th><th>District</th><th>Last donation</th><th>Status</th><th>Eligibility</th><th>Consent</th><th>Source</th><th></th>'+
         '</tr></thead><tbody>'+
         rows.map(d=>'<tr class="clickable" onclick="openDrawer(\'donor\',\''+d.id+'\')">'+
           '<td><div class="bold">'+esc(d.name)+'</div><div class="tiny dim">'+esc(d.id)+' · '+d.age+'/'+d.sex+' · '+(donorEmail(d)?'Email registered':'Email not registered')+'</div></td>'+
@@ -1912,7 +1985,9 @@ function pageDonors(){
           '<td class="muted">'+esc(d.district)+'</td>'+
           '<td class="muted">'+esc(d.last)+'</td>'+
           '<td>'+statusPill(d.status)+'</td>'+
-          '<td>'+statusPill(d.erk)+'</td>'+
+          '<td>'+statusPill(d.eligible==='Yes'?'Eligible':d.eligible==='No'?'Not Eligible':'Pending')+'</td>'+
+          '<td>'+statusPill(d.consent==='Yes'?'Consent Given':d.consent==='No'?'No Consent':'Pending')+'</td>'+
+          '<td>'+statusPill(d.erk||'Imported')+'</td>'+
           '<td>'+icon('chevron','ico-sm dim')+'</td>'+
         '</tr>').join('')+'</tbody></table>' : '<div class="empty">No donors match these filters.</div>')+
     '</div>'+
@@ -2728,15 +2803,15 @@ function xlDate(v){
   return isNaN(t)?null:new Date(t+43200000).toISOString().slice(0,10);
 }
 const XL_AL={
-  name:['name','fullname','donor','citizen','person','personname'],group:['bloodgroup','bloodtype','bloodgrp','bgroup','bg','bldgroup','group','abogroup','abo'],district:['district','districtname','dist','location','place'],
+  name:['donorname','donorfullname','fullname','name','donor','citizen','person','personname'],group:['bloodgroup','bloodtype','bloodgrp','bgroup','bg','bldgroup','group','abogroup','abo','bloodgroupname'],district:['district','districtname','dist','location','place'],
   phone:['phone','phoneno','phonenumber','mobile','mobileno','mobilenumber','contactnumber','contactno','contact','cell','cellno','mob','mobno','whatsapp','whatsappnumber','telephone'],
-  email:['email','emailid','emailaddress','mail'],age:['age'],gender:['gender','sex'],address:['address','fulladdress'],
+  email:['email','emailid','emailaddress','mail'],age:['age'],gender:['gender','sex'],address:['address','fulladdress'],city:['city','town'],state:['state','statename'],pincode:['pincode','pin','postalcode','zipcode'],
   type:['type','hospitaltype','centretype'],contact:['contactperson','contactname'],
   component:['component','bloodcomponent','componenttype','bloodproduct'],
   units:['units','unit','noofunits','numberofunits','quantity','qty','unitscollected','unitsissued','unitsutilised','unitsutilized'],
   date:['date'],hospital:['hospital','hospitalname'],reqid:['requestid','reqid'],donorid:['donorid'],
-  centreid:['bloodcentreid','bloodcenterid','centreid','centerid'],status:['status'],
-  last:['lastdonationdate','lastdonation','lastdonated','dateoflastdonation','lastdonateddate','lastdonationon'],count:['donationcount','totaldonations','noofdonations'],
+  centreid:['bloodcentreid','bloodcenterid','centreid','centerid'],status:['status','donorstatus','donorstate'],consent:['consent','consentstatus','consentfornotification','notificationconsent','consentgiven'],eligible:['eligibility','eligibilitystatus','donationeligibility','eligiblefordonation'],
+  last:['lastdonationdate','lastdonation','lastdonated','dateoflastdonation','lastdonateddate','lastdonationon'],erk:['donorstatus','eraktkoshstatus','source','sourceofdata'],count:['donationcount','totaldonations','noofdonations','numberofpreviousdonations','previousdonations'],
   pref:['preferredcontact','preferredcommunication','communicationpreference','preferredchannel'],
   source:['source','datasource'],willing:['willingness','willing'],patient:['patientname','patient'],
   reqtype:['requesttype','requestcategory'],casetype:['casetype'],ward:['ward'],ip:['ipnumber','ipno','ipnum'],
@@ -2744,7 +2819,7 @@ const XL_AL={
 };
 const XL_LBL={id:'ID',name:'Name',group:'Blood Group',district:'District',phone:'Phone',email:'Email',age:'Age',gender:'Gender',address:'Address',type:'Type',
   contact:'Contact Person',component:'Component',units:'Units',date:'Date',hospital:'Hospital',reqid:'Request ID',donorid:'Donor ID',centreid:'Blood Centre ID',
-  status:'Status',last:'Last Donation Date',count:'Donation Count',pref:'Preferred Contact',source:'Source',willing:'Willingness',patient:'Patient Name',
+  status:'Status',consent:'Consent',eligible:'Eligibility',erk:'e-RaktKosh Status',last:'Last Donation Date',count:'Donation Count',pref:'Preferred Contact',source:'Source',willing:'Willingness',patient:'Patient Name',
   reqtype:'Request Type',casetype:'Case Type',ward:'Ward',ip:'IP Number',surgery:'Surgery Date',outcome:'Outcome'};
 function xlLbl(cfg,f){ return (cfg.lbl&&cfg.lbl[f])||XL_LBL[f]||f; }
 function xlHash(s){ let a=5381,b=0; for(let i=0;i<s.length;i++){ const c=s.charCodeAt(i); a=((a<<5)+a+c)>>>0; b=(c+(b<<6)+(b<<16)-b)>>>0; } return (a.toString(36)+b.toString(36)).toUpperCase().slice(0,8); }
@@ -2755,6 +2830,9 @@ function xlClean(f,v,W){
     case 'group':{ const t0=String(v).toLowerCase().replace(/[\s_]+/g,''), t1=t0.replace(/positive|pos$/,'+').replace(/negative|neg$/,'-').replace(/ve$/,'').replace(/^(a|b|ab|o)rh/,'$1'), g=XL_GRP[t0]||XL_GRP[t1]; if(g) return g; W.push(f); return String(v).trim(); }
     case 'phone':{ let d=String(v).replace(/\D/g,''); if(d.length===12&&d.indexOf('91')===0) d=d.slice(2); if(/^[0-9]{10}$/.test(d)) return d; W.push(f); return String(v).trim(); }
     case 'email':{ const s=String(v).trim(); if(!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(s)) W.push(f); return s; }
+    case 'consent':{ const s=String(v).trim().toLowerCase(); if(/^(yes|y|true|consent|consented|given|opt.?in|agreed|available)$/.test(s)) return 'Yes'; if(/^(no|n|false|not.?consent|declined|denied|opt.?out|not given)$/.test(s)) return 'No'; if(!s) return ''; W.push(f); return String(v).trim(); }
+    case 'eligible':{ const s=String(v).trim().toLowerCase(); if(/^(yes|y|true|eligible|active|fit|fit for donation|fitfordonation)$/.test(s)) return 'Yes'; if(/^(no|n|false|not eligible|ineligible|deferred|unfit|not fit)$/.test(s)) return 'No'; if(!s) return ''; W.push(f); return String(v).trim(); }
+    case 'erk': return String(v).trim();
     case 'gender':{ const s=String(v).trim().toLowerCase()[0]; if(s==='m') return 'M'; if(s==='f') return 'F'; W.push(f); return ''; }
     case 'age':{ const n=Number(v); if(isNaN(n)||n<0||n>120){ W.push(f); return ''; } return n; }
     case 'units':{ const n=Number(v); if(isNaN(n)||n<=0){ W.push(f); return 0; } return n; }
@@ -2780,13 +2858,14 @@ const XL_CFG={
     lbl:{id:'Blood Centre ID',name:'Blood Centre Name'},keys:[{f:['name','district'],min:2},{f:['name'],min:1}],
     same:(z,r)=>r.name&&XL_N(z.name)===XL_N(r.name)&&XL_N(z.district)===XL_N(r.district),
     map:m=>({id:m.id,name:m.name||'—',district:m.district,type:m.type,address:m.address,phone:m.phone,email:m.email,contact:m.contact})},
-  Blood_Donor_DB:{store:()=>DONORS,pre:'D',core:['id','name','group','district','phone'],opt:['age','gender','email','last','count','pref','status'],
+  Blood_Donor_DB:{store:()=>DONORS,pre:'D',core:['id','name','group','district','phone'],opt:['age','gender','email','last','count','pref','status','consent','eligible','erk','address','city','state','pincode'],
     al:{id:['donorid','id'],name:['donorname','donorfullname','fullname','name']},lbl:{id:'Donor ID',name:'Donor Name'},keys:XL_PERSON_KEYS,
     same:(z,r)=>r.mobile&&z.mobile===r.mobile&&XL_N(z.name)===XL_N(r.name),
-    map:(m,e)=>({id:m.id,name:m.name||'Unnamed donor',age:m.age===''?'—':m.age,sex:m.gender||'—',group:m.group,district:m.district,mobile:m.phone,email:m.email,
-      last:m.last||(e?e.last:'—'),count:m.count!==''?m.count:(e?e.count:0),
-      status:['Active','Deferred','Unreachable'].find(x=>x.toLowerCase()===String(m.status).toLowerCase())||(e?e.status:'Active'),
-      erk:e?e.erk:'Pending',consent:e?e.consent:'Pending',pref:m.pref||(e?e.pref:'WhatsApp')})},
+    map:(m,e)=>{ const st=String(m.status||'').trim().toLowerCase(), es=String(m.eligible||'').trim().toLowerCase(), cs=String(m.consent||'').trim().toLowerCase();
+      const status=st==='inactive'?'Inactive':st.indexOf('defer')>-1?'Deferred':st==='unreachable'?'Unreachable':'Active';
+      const eligible=es==='yes'?'Yes':es==='no'?'No':(e?e.eligible:'Pending');
+      const consent=cs==='yes'?'Yes':cs==='no'?'No':(e?e.consent:'Pending');
+      return {id:m.id,name:m.name||'Unnamed donor',age:m.age===''?'—':m.age,sex:m.gender||'—',group:m.group,district:m.district,mobile:m.phone,email:m.email,last:m.last||(e?e.last:'—'),count:m.count!==''?m.count:(e?e.count:0),status:status,eligible:eligible,erk:m.erk||(e?e.erk:'e-RaktKosh'),consent:consent,pref:m.pref||(e?e.pref:'Email'),address:m.address||'',city:m.city||'',state:m.state||'',pincode:m.pincode||''}; }},
   Blood_Citizen_DB:{store:()=>CITIZENS,pre:'C',core:['id','name','group','district','phone'],opt:['age','gender','email','source','willing'],
     al:{id:['citizenid','id'],name:['citizenname','fullname','name']},lbl:{id:'Citizen ID',name:'Citizen Name'},keys:XL_PERSON_KEYS,
     same:(z,r)=>r.mobile&&z.mobile===r.mobile&&XL_N(z.name)===XL_N(r.name),
@@ -2829,7 +2908,7 @@ const XL_HINT={Hospital_DB:['hospital'],Blood_Centre_DB:['centre','center','bloo
   Blood_Collection_DB:['collection'],Blood_Request_DB:['request'],Blood_Issue_Supply_DB:['issue','supply'],Blood_Utilization_DB:['utili']};
 const XL_IDW={Hospital_DB:/hosp/,Blood_Centre_DB:/centre|center|^bc/,Blood_Donor_DB:/donor/,Blood_Citizen_DB:/citizen/,Blood_Collection_DB:/collection/,
   Blood_Request_DB:/request|^req/,Blood_Issue_Supply_DB:/issue|supply/,Blood_Utilization_DB:/utili[sz]ation/};
-function xlNameKey(n){ const nn=XL_N(n); return Object.keys(XL_CFG).find(k=>XL_N(k)===nn)||(nn==='bloodutilisationdb'?'Blood_Utilization_DB':null); }
+function xlNameKey(n){ const nn=XL_N(n); if(nn==='donordata'||nn==='eraktkoshdonordata'||nn==='donorreport') return 'Blood_Donor_DB'; if(nn==='bloodcentremaster'||nn==='bloodcentremasterdata') return 'Blood_Centre_DB'; return Object.keys(XL_CFG).find(k=>XL_N(k)===nn)||(nn==='bloodutilisationdb'?'Blood_Utilization_DB':null); }
 function xlRead(ws){
   let aoa; try{ aoa=XLSX.utils.sheet_to_json(ws,{header:1,defval:'',blankrows:true}); }catch(e){ return null; }
   const cnt=r=>r.filter(c=>String(c==null?'':c).trim()!=='').length;
@@ -2877,10 +2956,36 @@ function xlBuild(name,key,rd){
     if(!any){ empty++; continue; }
     const W=[], m={}, errs=[];
     fields.forEach(f=>{ m[f]=(f in fmap)?xlClean(f,orig[hdr[fmap[f]]],W):''; });
+    // Explicit e-RaktKosh header fallback so the real donor report always maps correctly.
+    if(key==='Blood_Donor_DB'){
+      const direct=(...names)=>{ for(const nm of names){ const j=hdr.findIndex(h=>XL_N(h)===nm); if(j>-1) return orig[hdr[j]]; } return ''; };
+      if(!m.id) m.id=String(direct('donorid','donorcode')).trim();
+      if(!m.name) m.name=String(direct('donorname','donorfullname')).trim();
+      if(!m.group) m.group=xlClean('group',direct('bloodgroup','bloodtype'),W);
+      if(!m.phone) m.phone=xlClean('phone',direct('mobilenumber','mobile','phonenumber'),W);
+      if(!m.email) m.email=xlClean('email',direct('emailaddress','email'),W);
+      if(!m.district) m.district=String(direct('district','districtname')).trim();
+      if(!m.age) m.age=xlClean('age',direct('age'),W);
+      if(!m.gender) m.gender=xlClean('gender',direct('gender','sex'),W);
+      if(!m.status) m.status=String(direct('donorstatus','status')).trim();
+      if(!m.eligible) m.eligible=xlClean('eligible',direct('donationeligibility','eligibilitystatus'),W);
+      if(!m.consent) m.consent=xlClean('consent',direct('consentfornotification','consentstatus'),W);
+      if(!m.last) m.last=xlClean('last',direct('lastdonationdate'),W);
+      if(m.count==='') m.count=xlClean('count',direct('numberofpreviousdonations'),W);
+      if(!m.pref) m.pref=String(direct('preferredcontactmethod','preferredcontact')).trim();
+      if(!m.erk) m.erk='e-RaktKosh';
+      if(!m.id) m.id='D-XL-'+xlHash(JSON.stringify(orig));
+    }
     if(hasCoreCol&&!cfg.core.some(f=>m[f]!==''&&m[f]!==0)) errs.push('no identifying information');
     const hasId=!!m.id, k=xlKey(cfg,m,orig);
     if(!m.id) m.id=cfg.pre+'-XL-'+xlHash(k);
     if(!errs.length){ if(seen[k]) errs.push('duplicate record in file'); seen[k]=1; }
+    if(!errs.length&&key==='Blood_Donor_DB'){
+      if(!m.name || !m.group) errs.push('missing donor name or blood group');
+      if(m.consent==='No') W.push('consent');
+      if(m.eligible==='No') W.push('eligible');
+      if(m.email && !EMAIL_RE.test(String(m.email).trim())) W.push('email');
+    }
     if(!errs.length&&W.length){ warnCount++; W.forEach(f=>{ const l=xlLbl(cfg,f); warnAgg[l]=(warnAgg[l]||0)+1; }); }
     items.push({i:r+1,orig:orig,m:m,hasId:hasId,errs:errs,warns:W.map(f=>xlLbl(cfg,f))});
   }
@@ -2983,6 +3088,7 @@ function excelImport(){
   S.excel={step:3,fileName:ex.fileName,res:null,prev:null,summary:rec}; render();
   toast(saved===false?'Imported, but browser storage is full — data will not survive a refresh':'Import completed: '+nw+' new, '+old+' existing, '+rej+' rejected');
 }
+function eraktKoshSourceBadge(d){ return d&&d.xl===1 ? '<span class="pill" style="margin-left:6px">e-RaktKosh Excel</span>' : ''; }
 function xlDataBlock(o){
   if(!o||!o.xdata) return '';
   const ks=Object.keys(o.xdata).filter(k=>o.xdata[k]!==''&&o.xdata[k]!=null); if(!ks.length) return '';
@@ -2995,8 +3101,9 @@ function pageExcel(){
   const typeSel=(cb)=>'<div class="field"><label>Type of data being uploaded</label><select onchange="'+cb+'"><option value="">Select Database Type</option>'+
     Object.keys(XL_CFG).map(k=>'<option value="'+k+'"'+(ex.type===k?' selected':'')+'>'+k+'</option>').join('')+'</select></div>';
   if(ex.step===1){
-    body='<div class="card card-pad"><h4 style="font-size:15px;margin-bottom:6px">Upload TNSBTC Database Excel</h4>'+
-      '<p class="muted sm" style="margin-bottom:12px">Upload one Excel workbook containing TNSBTC database data.</p>'+
+    body='<div class="card card-pad"><h4 style="font-size:15px;margin-bottom:6px">Upload e-RaktKosh / TNSBTC Excel</h4>'+
+      '<p class="muted sm" style="margin-bottom:12px">Upload the donor Excel received from e-RaktKosh. The system will read the <b>Donor_Data</b> and <b>Blood_Centre_Master</b> sheets, validate the donor records, and import them into the Blood Donor Registry.</p>'+
+      '<div class="tiny muted" style="margin-bottom:12px"><b>For donor notification:</b> Blood Group, Donor Name and contact details are important. Email, donor status, eligibility and consent are also checked when available.</div>'+
       typeSel('S.excel.type=this.value')+
       '<div class="field"><label>Excel file (.xlsx)</label><input type="file" accept=".xlsx,.xls,.xlsm" onchange="excelOnFile(this)"></div>'+
       '<div class="tiny muted" style="margin-top:8px">Select the database type, or leave it unselected if the workbook contains sheets named after the database types.</div></div>'+
@@ -3010,7 +3117,7 @@ function pageExcel(){
       if(s.rejected) n.push(num(s.rejected)+' record(s) will be skipped (duplicate or no identifying information).');
       if(s.warnCount) n.push(num(s.warnCount)+' record(s) contain values that did not match the expected format and will be imported as provided.');
       return n.length?'<div style="margin-top:10px"><b class="sm">'+s.key+'</b><ul class="tiny muted" style="margin:2px 0 0 18px">'+n.map(t=>'<li>'+t+'</li>').join('')+'</ul></div>':''; }).join('');
-    body='<div class="card card-pad"><div class="row-between" style="margin-bottom:12px"><div><b>'+esc(ex.fileName)+'</b></div><div class="tiny muted">'+(ex.wb?ex.wb.SheetNames.length:0)+' worksheet(s) in workbook</div></div>'+
+    body='<div class="card card-pad"><div class="tiny muted" style="margin-bottom:10px"><b>e-RaktKosh validation:</b> donor rows are checked for identifying information, blood group format, duplicate records, email format, and (when supplied) consent / eligibility values. Rows with warnings can still be reviewed before import.</div><div class="row-between" style="margin-bottom:12px"><div><b>'+esc(ex.fileName)+'</b></div><div class="tiny muted">'+(ex.wb?ex.wb.SheetNames.length:0)+' worksheet(s) in workbook</div></div>'+
       typeSel('excelType(this.value)')+
       (R.type&&R.names.length>1?'<div class="field"><label>Worksheet to import</label><select onchange="excelSheet(this.value)">'+
         R.names.map(n=>'<option value="'+esc(n.name)+'"'+(n.name===R.chosen?' selected':'')+'>'+esc(n.name)+(n.best?' (best match)':'')+'</option>').join('')+'</select></div>':'')+
@@ -3038,6 +3145,7 @@ function pageExcel(){
       stat('Sheets Processed',u.sheets)+stat('Total Rows',u.total)+stat('New Records',u.newRec,'var(--teal)')+stat('Existing Records',u.existing,'var(--amber)')+stat('Rejected Records',u.rejected,'var(--brand)')+'</div>'+
       '<div class="tiny muted" style="margin-top:10px">Status: '+esc(u.status)+'</div>'+
       '<ul class="tiny" style="margin:8px 0 0 18px">'+u.detail.map(d=>'<li>'+esc(d)+'</li>').join('')+'</ul>'+
+      (DONORS.some(d=>d.xl)?'<div class="banner banner-info" style="margin-top:14px"><div><b>Donor Registry updated.</b> The imported e-RaktKosh donor names are now available for blood-group matching. Showing the first 10 imported donors:</div><div style="margin-top:8px"><b>'+DONORS.filter(d=>d.xl).slice(0,10).map(d=>esc(d.name)).join(' &middot; ')+'</b></div></div>':'')+
       '<div class="row" style="margin-top:14px;gap:8px"><button class="btn" onclick="excelReset()">Upload another workbook</button>'+
       '<button class="btn" onclick="go(\'donors\')">Open Blood Donor Registry</button><button class="btn" onclick="go(\'citizens\')">Open Blood Citizen Registry</button>'+
       '<button class="btn" onclick="go(\'requests\')">Open Live Requests</button></div></div>';
